@@ -12,6 +12,7 @@ from aws_cdk import (
     aws_logs as logs,
     aws_lambda as lambda_,
     custom_resources as cr,
+    aws_s3 as s3,
     CfnOutput,
     RemovalPolicy,
     Duration
@@ -43,10 +44,27 @@ class GaraCdkStack(Stack):
             ]
         )
 
-        # Create ECR repository for Docker images
+        # Create S3 bucket for image storage
+        image_bucket = s3.Bucket(
+            self, "GaraImageBucket",
+            bucket_name=f"gara-images-{self.account}-{self.region}",
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True
+        )
+
+        # Create ECR repository for gara-image service
         ecr_repo = ecr.Repository(
             self, "GaraEcrRepo",
-            repository_name="gara-app",
+            repository_name="gara-image-app",
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_images=True
+        )
+
+        # Create ECR repository for frontend
+        frontend_ecr_repo = ecr.Repository(
+            self, "GaraFrontendEcrRepo",
+            repository_name="gara-frontend-app",
             removal_policy=RemovalPolicy.DESTROY,
             auto_delete_images=True
         )
@@ -77,6 +95,33 @@ class GaraCdkStack(Stack):
             "GithubToken"
         )
 
+        # Reference the gara API key secret
+        api_key_secret = secretmanager.Secret.from_secret_name_v2(
+            self, "GaraApiKey",
+            "gara-api-key"
+        )
+
+        # Create task role for gara-image ECS tasks
+        task_role = iam.Role(
+            self, "GaraTaskRole",
+            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com")
+        )
+
+        # Grant S3 permissions to task role
+        image_bucket.grant_read_write(task_role)
+
+        # Grant Secrets Manager permissions to task role
+        api_key_secret.grant_read(task_role)
+
+        # Create task role for frontend ECS tasks
+        frontend_task_role = iam.Role(
+            self, "GaraFrontendTaskRole",
+            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com")
+        )
+
+        # Grant S3 read-only permissions to frontend task role
+        image_bucket.grant_read(frontend_task_role)
+
         # Create IAM role for CodeBuild
         codebuild_role = iam.Role(
             self, "CodeBuidRole",
@@ -95,6 +140,9 @@ class GaraCdkStack(Stack):
             access_token=github_secret.secret_value_from_json('github')
         )
 
+        # Grant CodeBuild permissions to push to frontend ECR
+        frontend_ecr_repo.grant_pull_push(codebuild_role)
+
         # Create CodeBuild project
         build_project = codebuild.Project(
             self, "GaraBuildProject",
@@ -112,6 +160,9 @@ class GaraCdkStack(Stack):
                     ),
                     "ECR_REPOSITORY_URI": codebuild.BuildEnvironmentVariable(
                         value=ecr_repo.repository_uri
+                    ),
+                    "FRONTEND_ECR_REPOSITORY_URI": codebuild.BuildEnvironmentVariable(
+                        value=frontend_ecr_repo.repository_uri
                     ),
                     "GITHUB_TOKEN": codebuild.BuildEnvironmentVariable(
                         value=github_secret.secret_arn,
@@ -146,9 +197,10 @@ class GaraCdkStack(Stack):
                     "build": {
                         "commands": [
                             "echo Build started on `date`",
-                            "echo Building the Docker image...",
-                            "docker build -t $ECR_REPOSITORY_URI:latest .",
-                            "docker tag $ECR_REPOSITORY_URI:latest $ECR_REPOSITORY_URI:$IMAGE_TAG"
+                            "echo Building gara-image service...",
+                            "cd gara-image && docker build -t $ECR_REPOSITORY_URI:latest -t $ECR_REPOSITORY_URI:$IMAGE_TAG . && cd ..",
+                            "echo Building gara-frontend service...",
+                            "cd gara-frontend && docker build -t $FRONTEND_ECR_REPOSITORY_URI:latest -t $FRONTEND_ECR_REPOSITORY_URI:$IMAGE_TAG . && cd .."
                         ]
                     },
                     "post_build": {
@@ -157,13 +209,16 @@ class GaraCdkStack(Stack):
                             "echo Pushing the Docker images...",
                             "docker push $ECR_REPOSITORY_URI:latest",
                             "docker push $ECR_REPOSITORY_URI:$IMAGE_TAG",
-                            "echo Writing image definitions file...",
-                            "printf '[{\"name\":\"gara-container\",\"imageUri\":\"%s\"}]' $ECR_REPOSITORY_URI:latest > imagedefinitions.json"
+                            "docker push $FRONTEND_ECR_REPOSITORY_URI:latest",
+                            "docker push $FRONTEND_ECR_REPOSITORY_URI:$IMAGE_TAG",
+                            "echo Writing image definitions files...",
+                            "printf '[{\"name\":\"gara-image-container\",\"imageUri\":\"%s\"}]' $ECR_REPOSITORY_URI:latest > gara-image-definitions.json",
+                            "printf '[{\"name\":\"gara-frontend-container\",\"imageUri\":\"%s\"}]' $FRONTEND_ECR_REPOSITORY_URI:latest > gara-frontend-definitions.json"
                         ]
                     }
                 },
                 "artifacts": {
-                    "files": ["imagedefinitions.json"]
+                    "files": ["gara-image-definitions.json", "gara-frontend-definitions.json"]
                 }
             }),
             timeout=Duration.minutes(30)
@@ -175,19 +230,20 @@ class GaraCdkStack(Stack):
         # Create Task Definition
         task_definition = ecs.Ec2TaskDefinition(
             self, "GaraTaskDef",
-            network_mode=ecs.NetworkMode.BRIDGE
+            network_mode=ecs.NetworkMode.BRIDGE,
+            task_role=task_role
         )
 
         # Add container to task definition
         # Use nginx as placeholder - it stays running and responds to health checks
         # The pipeline will update this with the actual image
         task_definition.add_container(
-            "gara-container",
+            "gara-image-container",
             image=ecs.ContainerImage.from_registry("nginx:alpine"),
             memory_limit_mib=1942,
             cpu=256,
             logging=ecs.LogDrivers.aws_logs(
-                stream_prefix="gara",
+                stream_prefix="gara-image",
                 log_retention=logs.RetentionDays.ONE_WEEK
             ),
             port_mappings=[
@@ -196,7 +252,13 @@ class GaraCdkStack(Stack):
                     host_port=80,
                     protocol=ecs.Protocol.TCP
                 )
-            ]
+            ],
+            environment={
+                "S3_BUCKET_NAME": image_bucket.bucket_name,
+                "AWS_REGION": self.region,
+                "SECRETS_MANAGER_API_KEY_NAME": "gara-api-key",
+                "PORT": "80"
+            }
         )
 
         # Create ECS Service with Application Load Balancer
@@ -204,7 +266,7 @@ class GaraCdkStack(Stack):
         fargate_service = ecs_patterns.ApplicationLoadBalancedEc2Service(
             self, "GaraService",
             cluster=cluster,
-            service_name="gara-service",
+            service_name="gara-image-service",
             task_definition=task_definition,
             desired_count=1,
             public_load_balancer=True,
@@ -214,6 +276,61 @@ class GaraCdkStack(Stack):
 
         # Configure health check for the target group
         fargate_service.target_group.configure_health_check(
+            path="/",
+            healthy_http_codes="200-399",
+            interval=Duration.seconds(60),
+            timeout=Duration.seconds(10),
+            healthy_threshold_count=2,
+            unhealthy_threshold_count=3
+        )
+
+        # Create Frontend Task Definition
+        frontend_task_definition = ecs.Ec2TaskDefinition(
+            self, "GaraFrontendTaskDef",
+            network_mode=ecs.NetworkMode.BRIDGE,
+            task_role=frontend_task_role
+        )
+
+        # Add container to frontend task definition
+        frontend_task_definition.add_container(
+            "gara-frontend-container",
+            image=ecs.ContainerImage.from_registry("nginx:alpine"),
+            memory_limit_mib=1024,
+            cpu=256,
+            logging=ecs.LogDrivers.aws_logs(
+                stream_prefix="gara-frontend",
+                log_retention=logs.RetentionDays.ONE_WEEK
+            ),
+            port_mappings=[
+                ecs.PortMapping(
+                    container_port=3000,  # Next.js default port
+                    host_port=3000,
+                    protocol=ecs.Protocol.TCP
+                )
+            ],
+            environment={
+                "NEXT_PUBLIC_API_URL": f"http://{fargate_service.load_balancer.load_balancer_dns_name}",
+                "NEXTAUTH_URL": f"http://<frontend-alb-dns>",
+                "NEXTAUTH_SECRET": "change-me-in-production",
+                "S3_BUCKET_NAME": image_bucket.bucket_name,
+                "AWS_REGION": self.region,
+            }
+        )
+
+        # Create Frontend ECS Service with Application Load Balancer
+        frontend_service = ecs_patterns.ApplicationLoadBalancedEc2Service(
+            self, "GaraFrontendService",
+            cluster=cluster,
+            service_name="gara-frontend-service",
+            task_definition=frontend_task_definition,
+            desired_count=1,
+            public_load_balancer=True,
+            listener_port=80,
+            health_check_grace_period=Duration.seconds(60)
+        )
+
+        # Configure health check for the frontend target group
+        frontend_service.target_group.configure_health_check(
             path="/",
             healthy_http_codes="200-399",
             interval=Duration.seconds(60),
@@ -260,22 +377,31 @@ class GaraCdkStack(Stack):
             actions=[build_action]  # type: ignore
         )
 
-        # Deploy stage - this will update the task definition and scale the service
-        deploy_action = codepipeline_actions.EcsDeployAction(
-            action_name="Deploy",
+        # Deploy stage - deploy to both gara-image and gara-frontend services
+        deploy_backend_action = codepipeline_actions.EcsDeployAction(
+            action_name="DeployBackend",
             service=fargate_service.service,
             input=build_output,
-            deployment_timeout=Duration.minutes(10)
+            deployment_timeout=Duration.minutes(10),
+            image_definitions_file=codepipeline.ArtifactPath(build_output, "gara-image-definitions.json")
+        )
+
+        deploy_frontend_action = codepipeline_actions.EcsDeployAction(
+            action_name="DeployFrontend",
+            service=frontend_service.service,
+            input=build_output,
+            deployment_timeout=Duration.minutes(10),
+            image_definitions_file=codepipeline.ArtifactPath(build_output, "gara-frontend-definitions.json")
         )
 
         pipeline.add_stage(
             stage_name="Deploy",
-            actions=[deploy_action]  # type: ignore
+            actions=[deploy_backend_action, deploy_frontend_action]  # type: ignore
         )
-
 
         # Add dependency to ensure pipeline triggers after initial deployment
         pipeline.node.add_dependency(fargate_service)  # type: ignore
+        pipeline.node.add_dependency(frontend_service)  # type: ignore
 
         # Create custom resource to trigger the pipeline on stack creation
         trigger_resource = cr.AwsCustomResource(
@@ -299,16 +425,37 @@ class GaraCdkStack(Stack):
         # Ensure the custom resource runs after the pipeline is created
         trigger_resource.node.add_dependency(pipeline)  # type: ignore
 
-        # Output the Load Balancer URL
+        # Output the Backend Load Balancer URL
         CfnOutput(
-            self, "LoadBalancerDNS",
+            self, "BackendLoadBalancerDNS",
             value=fargate_service.load_balancer.load_balancer_dns_name,
-            description="URL of the Application Load Balancer"
+            description="URL of the Application Load Balancer for gara-image service"
+        )
+
+        # Output the Frontend Load Balancer URL
+        CfnOutput(
+            self, "FrontendLoadBalancerDNS",
+            value=frontend_service.load_balancer.load_balancer_dns_name,
+            description="URL of the Application Load Balancer for gara-frontend service"
         )
 
         # Output the ECR Repository URI
         CfnOutput(
             self, "ECRRepositoryURI",
             value=ecr_repo.repository_uri,
-            description="URI of the ECR repository"
+            description="URI of the ECR repository for gara-image"
+        )
+
+        # Output the Frontend ECR Repository URI
+        CfnOutput(
+            self, "FrontendECRRepositoryURI",
+            value=frontend_ecr_repo.repository_uri,
+            description="URI of the ECR repository for gara-frontend"
+        )
+
+        # Output the S3 bucket name
+        CfnOutput(
+            self, "ImageBucketName",
+            value=image_bucket.bucket_name,
+            description="Name of the S3 bucket for image storage"
         )
