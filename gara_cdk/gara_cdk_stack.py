@@ -13,6 +13,7 @@ from aws_cdk import (
     aws_lambda as lambda_,
     custom_resources as cr,
     aws_s3 as s3,
+    aws_dynamodb as dynamodb,
     CfnOutput,
     RemovalPolicy,
     Duration
@@ -51,6 +52,34 @@ class GaraCdkStack(Stack):
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
             removal_policy=RemovalPolicy.DESTROY,
             auto_delete_objects=True
+        )
+
+        # Create DynamoDB table for album management
+        albums_table = dynamodb.Table(
+            self, "GaraAlbumsTable",
+            table_name=f"gara-albums-{self.account}-{self.region}",
+            partition_key=dynamodb.Attribute(
+                name="AlbumId",
+                type=dynamodb.AttributeType.STRING
+            ),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            removal_policy=RemovalPolicy.RETAIN,
+            point_in_time_recovery=True
+        )
+
+        # Add Global Secondary Index for querying published albums efficiently
+        # This allows filtering by Published status with CreatedAt sorting
+        albums_table.add_global_secondary_index(
+            index_name="PublishedIndex",
+            partition_key=dynamodb.Attribute(
+                name="Published",
+                type=dynamodb.AttributeType.STRING
+            ),
+            sort_key=dynamodb.Attribute(
+                name="CreatedAt",
+                type=dynamodb.AttributeType.NUMBER
+            ),
+            projection_type=dynamodb.ProjectionType.ALL
         )
 
         # Create ECR repository for gara-image service
@@ -113,6 +142,9 @@ class GaraCdkStack(Stack):
         # Grant Secrets Manager permissions to task role
         api_key_secret.grant_read(task_role)
 
+        # Grant DynamoDB read/write permissions to backend task role
+        albums_table.grant_read_write_data(task_role)
+
         # Create task role for frontend ECS tasks
         frontend_task_role = iam.Role(
             self, "GaraFrontendTaskRole",
@@ -121,6 +153,12 @@ class GaraCdkStack(Stack):
 
         # Grant S3 read-only permissions to frontend task role
         image_bucket.grant_read(frontend_task_role)
+
+        # Grant DynamoDB read-only permissions to frontend task role
+        albums_table.grant_read_data(frontend_task_role)
+
+        # Grant API key secret read permission to frontend task role (for proxy authentication)
+        api_key_secret.grant_read(frontend_task_role)
 
         # Create IAM role for CodeBuild
         codebuild_role = iam.Role(
@@ -257,7 +295,8 @@ class GaraCdkStack(Stack):
                 "S3_BUCKET_NAME": image_bucket.bucket_name,
                 "AWS_REGION": self.region,
                 "SECRETS_MANAGER_API_KEY_NAME": "gara-api-key",
-                "PORT": "80"
+                "PORT": "80",
+                "DYNAMODB_TABLE_NAME": albums_table.table_name
             }
         )
 
@@ -314,6 +353,9 @@ class GaraCdkStack(Stack):
                 "NEXTAUTH_SECRET": "change-me-in-production",
                 "S3_BUCKET_NAME": image_bucket.bucket_name,
                 "AWS_REGION": self.region,
+            },
+            secrets={
+                "GARA_API_KEY": ecs.Secret.from_secrets_manager(api_key_secret)
             }
         )
 
@@ -381,17 +423,15 @@ class GaraCdkStack(Stack):
         deploy_backend_action = codepipeline_actions.EcsDeployAction(
             action_name="DeployBackend",
             service=fargate_service.service,
-            input=build_output,
             deployment_timeout=Duration.minutes(10),
-            image_definitions_file=codepipeline.ArtifactPath(build_output, "gara-image-definitions.json")
+            image_file=codepipeline.ArtifactPath(build_output, "gara-image-definitions.json")
         )
 
         deploy_frontend_action = codepipeline_actions.EcsDeployAction(
             action_name="DeployFrontend",
             service=frontend_service.service,
-            input=build_output,
             deployment_timeout=Duration.minutes(10),
-            image_definitions_file=codepipeline.ArtifactPath(build_output, "gara-frontend-definitions.json")
+            image_file=codepipeline.ArtifactPath(build_output, "gara-frontend-definitions.json")
         )
 
         pipeline.add_stage(
@@ -458,4 +498,11 @@ class GaraCdkStack(Stack):
             self, "ImageBucketName",
             value=image_bucket.bucket_name,
             description="Name of the S3 bucket for image storage"
+        )
+
+        # Output the DynamoDB table name
+        CfnOutput(
+            self, "AlbumsTableName",
+            value=albums_table.table_name,
+            description="DynamoDB table name for albums"
         )
