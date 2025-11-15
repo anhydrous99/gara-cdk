@@ -49,6 +49,9 @@ class InfraConfig:
     BACKEND_ECR_NAME = "gara-image-app"
     FRONTEND_ECR_NAME = "gara-frontend-app"
 
+    # VPC
+    VPC_NAME = "gara-vpc"
+
     # ECS
     ECS_CLUSTER_NAME = "gara-cluster"
     INSTANCE_TYPE = "t3.small"
@@ -58,6 +61,8 @@ class InfraConfig:
 
     # Task Definitions
     EXPECTED_TASK_DEFINITIONS = 2
+    BACKEND_TASK_FAMILY = "gara-backend-task"
+    FRONTEND_TASK_FAMILY = "gara-frontend-task"
     BACKEND_CONTAINER_NAME = "gara-image-container"
     FRONTEND_CONTAINER_NAME = "gara-frontend-container"
     BACKEND_MEMORY = 1942
@@ -66,6 +71,10 @@ class InfraConfig:
     BACKEND_PORT = 80
     FRONTEND_PORT = 3000
     NETWORK_MODE = "bridge"
+
+    # CloudWatch Log Groups
+    BACKEND_LOG_GROUP_NAME = "/ecs/gara-image"
+    FRONTEND_LOG_GROUP_NAME = "/ecs/gara-frontend"
 
     # Load Balancers
     EXPECTED_LOAD_BALANCERS = 2
@@ -100,8 +109,11 @@ class InfraConfig:
 
     # IAM
     MIN_EXPECTED_ROLES = 5
+    BACKEND_TASK_ROLE_NAME = "gara-backend-task-role"
+    FRONTEND_TASK_ROLE_NAME = "gara-frontend-task-role"
+    CODEBUILD_ROLE_NAME = "gara-codebuild-role"
     MIN_EXPECTED_SECURITY_GROUPS = 3
-    MIN_EXPECTED_LOG_GROUPS = 1
+    MIN_EXPECTED_LOG_GROUPS = 2  # Backend + Frontend log groups
 
 
 # CloudFormation Output Names

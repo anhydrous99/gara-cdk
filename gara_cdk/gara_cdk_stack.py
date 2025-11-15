@@ -10,7 +10,6 @@ from aws_cdk import (
     aws_ecr as ecr,
     aws_secretsmanager as secretmanager,
     aws_logs as logs,
-    aws_lambda as lambda_,
     custom_resources as cr,
     aws_s3 as s3,
     aws_dynamodb as dynamodb,
@@ -42,7 +41,8 @@ class GaraCdkStack(Stack):
                     subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS,
                     cidr_mask=24
                 )
-            ]
+            ],
+            vpc_name="gara-vpc"
         )
 
         # Create S3 bucket for image storage
@@ -63,7 +63,7 @@ class GaraCdkStack(Stack):
                 type=dynamodb.AttributeType.STRING
             ),
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
-            removal_policy=RemovalPolicy.RETAIN,
+            removal_policy=RemovalPolicy.DESTROY,
             point_in_time_recovery=True
         )
 
@@ -106,16 +106,17 @@ class GaraCdkStack(Stack):
             container_insights=True
         )
 
-        # Add capacity to cluster (t3.small instances)
+        # Add capacity to cluster (t3.medium instances)
         cluster.add_capacity(
             "GaraAutoScalingGroup",
-            instance_type=ec2.InstanceType("t3.small"),
-            min_capacity=1,
+            instance_type=ec2.InstanceType("t3.medium"),
+            min_capacity=2,
             max_capacity=3,
-            desired_capacity=1,
+            desired_capacity=2,
             vpc_subnets=ec2.SubnetSelection(
                 subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
-            )
+            ),
+            can_containers_access_instance_role=True
         )
 
         # Reference the existing GitHub token secret
@@ -133,6 +134,7 @@ class GaraCdkStack(Stack):
         # Create task role for gara-image ECS tasks
         task_role = iam.Role(
             self, "GaraTaskRole",
+            role_name="gara-backend-task-role",
             assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com")
         )
 
@@ -148,6 +150,7 @@ class GaraCdkStack(Stack):
         # Create task role for frontend ECS tasks
         frontend_task_role = iam.Role(
             self, "GaraFrontendTaskRole",
+            role_name="gara-frontend-task-role",
             assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com")
         )
 
@@ -162,11 +165,27 @@ class GaraCdkStack(Stack):
 
         # Create IAM role for CodeBuild
         codebuild_role = iam.Role(
-            self, "CodeBuidRole",
+            self, "CodeBuildRole",
+            role_name="gara-codebuild-role",
             assumed_by=iam.ServicePrincipal("codebuild.amazonaws.com"),
             managed_policies=[
                 iam.ManagedPolicy.from_aws_managed_policy_name("AmazonEC2ContainerRegistryPowerUser")
             ]
+        )
+
+        # Grant CodeBuild CloudWatch Logs permissions
+        codebuild_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                ],
+                resources=[
+                    "arn:aws:logs:*:*:log-group:/aws/codebuild/*",
+                    "arn:aws:logs:*:*:log-group:/aws/codebuild/*:log-stream:*"
+                ]
+            )
         )
 
         # Grant CodeBuild access to the secret
@@ -178,8 +197,48 @@ class GaraCdkStack(Stack):
             access_token=github_secret.secret_value_from_json('github')
         )
 
+        # Grant CodeBuild permissions to access pipeline artifacts in S3
+        # CodeBuild needs access to the pipeline artifact bucket for input/output
+        codebuild_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "s3:GetObject",
+                    "s3:GetObjectVersion",
+                    "s3:PutObject",
+                    "s3:PutObjectAcl"
+                ],
+                resources=["arn:aws:s3:::codepipeline-*/*"],
+                effect=iam.Effect.ALLOW
+            )
+        )
+
+        # Grant CodeBuild permissions to list buckets (for artifact management)
+        codebuild_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "s3:ListBucket",
+                    "s3:GetBucketVersioning"
+                ],
+                resources=["arn:aws:s3:::codepipeline-*"],
+                effect=iam.Effect.ALLOW
+            )
+        )
+
         # Grant CodeBuild permissions to push to frontend ECR
         frontend_ecr_repo.grant_pull_push(codebuild_role)
+
+        # Grant CodeBuild permissions for CloudWatch metrics and monitoring
+        codebuild_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "cloudwatch:PutMetricData",
+                    "cloudwatch:GetMetricData",
+                    "cloudwatch:ListMetrics"
+                ],
+                resources=["*"],
+                effect=iam.Effect.ALLOW
+            )
+        )
 
         # Create CodeBuild project
         build_project = codebuild.Project(
@@ -262,12 +321,40 @@ class GaraCdkStack(Stack):
             timeout=Duration.minutes(30)
         )
 
+        # Grant CodeBuild permissions for build state and diagnostics
+        codebuild_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "codebuild:BatchGetBuilds",
+                    "codebuild:BatchGetBuildBatches"
+                ],
+                resources=[build_project.project_arn],
+                effect=iam.Effect.ALLOW
+            )
+        )
+
         # Grant CodeBuild permissions to push to ECR
         ecr_repo.grant_pull_push(codebuild_role)
+
+        # Create explicit CloudWatch log groups
+        backend_log_group = logs.LogGroup(
+            self, "GaraBackendLogGroup",
+            log_group_name="/ecs/gara-image",
+            retention=logs.RetentionDays.ONE_WEEK,
+            removal_policy=RemovalPolicy.DESTROY
+        )
+
+        frontend_log_group = logs.LogGroup(
+            self, "GaraFrontendLogGroup",
+            log_group_name="/ecs/gara-frontend",
+            retention=logs.RetentionDays.ONE_WEEK,
+            removal_policy=RemovalPolicy.DESTROY
+        )
 
         # Create Task Definition
         task_definition = ecs.Ec2TaskDefinition(
             self, "GaraTaskDef",
+            family="gara-backend-task",
             network_mode=ecs.NetworkMode.BRIDGE,
             task_role=task_role
         )
@@ -281,8 +368,8 @@ class GaraCdkStack(Stack):
             memory_limit_mib=1942,
             cpu=256,
             logging=ecs.LogDrivers.aws_logs(
-                stream_prefix="gara-image",
-                log_retention=logs.RetentionDays.ONE_WEEK
+                log_group=backend_log_group,
+                stream_prefix="gara-image"
             ),
             port_mappings=[
                 ecs.PortMapping(
@@ -326,30 +413,30 @@ class GaraCdkStack(Stack):
         # Create Frontend Task Definition
         frontend_task_definition = ecs.Ec2TaskDefinition(
             self, "GaraFrontendTaskDef",
+            family="gara-frontend-task",
             network_mode=ecs.NetworkMode.BRIDGE,
             task_role=frontend_task_role
         )
 
         # Add container to frontend task definition
-        frontend_task_definition.add_container(
+        frontend_container = frontend_task_definition.add_container(
             "gara-frontend-container",
             image=ecs.ContainerImage.from_registry("nginx:alpine"),
             memory_limit_mib=1024,
             cpu=256,
             logging=ecs.LogDrivers.aws_logs(
-                stream_prefix="gara-frontend",
-                log_retention=logs.RetentionDays.ONE_WEEK
+                log_group=frontend_log_group,
+                stream_prefix="gara-frontend"
             ),
             port_mappings=[
                 ecs.PortMapping(
-                    container_port=3000,  # Next.js default port
-                    host_port=3000,
+                    container_port=80,  # Next.js port standardized to 80
+                    host_port=80,
                     protocol=ecs.Protocol.TCP
                 )
             ],
             environment={
                 "NEXT_PUBLIC_API_URL": f"http://{fargate_service.load_balancer.load_balancer_dns_name}",
-                "NEXTAUTH_URL": f"http://<frontend-alb-dns>",
                 "NEXTAUTH_SECRET": "change-me-in-production",
                 "S3_BUCKET_NAME": image_bucket.bucket_name,
                 "AWS_REGION": self.region,
@@ -379,6 +466,12 @@ class GaraCdkStack(Stack):
             timeout=Duration.seconds(10),
             healthy_threshold_count=2,
             unhealthy_threshold_count=3
+        )
+
+        # Update frontend container with NEXTAUTH_URL (set after service is created to get ALB DNS)
+        frontend_container.add_environment(
+            "NEXTAUTH_URL",
+            f"http://{frontend_service.load_balancer.load_balancer_dns_name}"
         )
 
         # Create CodePipeline for continuous deployment
