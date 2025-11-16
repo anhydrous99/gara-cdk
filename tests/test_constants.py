@@ -42,7 +42,7 @@ class InfraConfig:
     SUBNET_CIDR_MASK = "/24"
 
     # S3
-    EXPECTED_S3_BUCKETS = 2  # Image bucket + Pipeline artifacts
+    EXPECTED_S3_BUCKETS = 3  # Image bucket + Backend pipeline artifacts + Frontend pipeline artifacts
 
     # ECR
     EXPECTED_ECR_REPOS = 2  # Backend + Frontend
@@ -54,23 +54,18 @@ class InfraConfig:
 
     # ECS
     ECS_CLUSTER_NAME = "gara-cluster"
-    INSTANCE_TYPE = "t3.small"
-    MIN_CAPACITY = "1"
-    MAX_CAPACITY = "3"
-    DESIRED_CAPACITY = "1"
 
-    # Task Definitions
+    # Task Definitions (Fargate)
     EXPECTED_TASK_DEFINITIONS = 2
     BACKEND_TASK_FAMILY = "gara-backend-task"
     FRONTEND_TASK_FAMILY = "gara-frontend-task"
     BACKEND_CONTAINER_NAME = "gara-image-container"
     FRONTEND_CONTAINER_NAME = "gara-frontend-container"
-    BACKEND_MEMORY = 1942
-    FRONTEND_MEMORY = 1024
-    CONTAINER_CPU = 256
-    BACKEND_PORT = 80
-    FRONTEND_PORT = 3000
-    NETWORK_MODE = "bridge"
+    TASK_CPU = "512"  # Fargate task-level CPU
+    TASK_MEMORY = "1024"  # Fargate task-level memory
+    BACKEND_PORT = 8080  # Non-root user requires port > 1024
+    FRONTEND_PORT = 80  # Updated from 3000 to 80
+    NETWORK_MODE = "awsvpc"  # Required for Fargate
 
     # CloudWatch Log Groups
     BACKEND_LOG_GROUP_NAME = "/ecs/gara-image"
@@ -89,16 +84,19 @@ class InfraConfig:
     HEALTHY_THRESHOLD = 2
     UNHEALTHY_THRESHOLD = 3
 
-    # CodeBuild
-    BUILD_PROJECT_NAME = "gara-build"
+    # CodeBuild (Dual Pipelines)
+    BACKEND_BUILD_PROJECT_NAME = "gara-image-build"
+    FRONTEND_BUILD_PROJECT_NAME = "gara-frontend-build"
     BUILD_IMAGE = "aws/codebuild/standard:7.0"
     BUILD_TIMEOUT = 30
 
-    # CodePipeline
-    PIPELINE_NAME = "gara-deployment-pipeline"
-    PIPELINE_STAGES = 3
+    # CodePipeline (Dual Pipelines)
+    BACKEND_PIPELINE_NAME = "gara-backend-pipeline"
+    FRONTEND_PIPELINE_NAME = "gara-frontend-pipeline"
+    PIPELINE_STAGES = 3  # Source, Build, Deploy (per pipeline)
     GITHUB_OWNER = "anhydrous99"
-    GITHUB_REPO = "gara"
+    BACKEND_GITHUB_REPO = "gara-image"
+    FRONTEND_GITHUB_REPO = "gara-frontend"
     GITHUB_BRANCH = "main"
 
     # CloudWatch Logs
