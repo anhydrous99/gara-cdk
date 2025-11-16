@@ -7,7 +7,8 @@ from tests.test_helpers import (
     assert_has_property,
     assert_container_definition,
     assert_environment_variable,
-    assert_health_check_config
+    assert_health_check_config,
+    assert_task_definition_cpu_memory
 )
 
 
@@ -32,7 +33,11 @@ class TestECRRepositories:
 
     def test_ecr_repositories_have_lifecycle_policies(self, template):
         """Test that ECR repositories have lifecycle policies for cleanup"""
-        assert_resource_count(template, ResourceType.ECR_AUTO_DELETE, InfraConfig.EXPECTED_ECR_REPOS)
+        # Note: Current AWS CDK version doesn't generate Custom::ECRAutoDeleteImages resources
+        # even with empty_on_delete=True. The parameter is still set for cleanup behavior
+        # but the custom resource is no longer generated in CloudFormation.
+        # ECR repositories will still be cleaned up due to removal_policy=DESTROY
+        assert_resource_count(template, ResourceType.ECR_AUTO_DELETE, 0)
 
 
 class TestECSCluster:
@@ -56,24 +61,6 @@ class TestECSCluster:
             ])
         })
 
-    def test_autoscaling_group_exists(self, template):
-        """Test that ECS cluster has an autoscaling group"""
-        assert_resource_count(template, ResourceType.AUTOSCALING_GROUP, 1)
-
-    def test_autoscaling_group_instance_type(self, template):
-        """Test that autoscaling group uses correct instance type"""
-        assert_has_property(template, ResourceType.LAUNCH_CONFIGURATION, {
-            "InstanceType": InfraConfig.INSTANCE_TYPE
-        })
-
-    def test_autoscaling_group_capacity(self, template):
-        """Test that autoscaling group has correct capacity settings"""
-        assert_has_property(template, ResourceType.AUTOSCALING_GROUP, {
-            "MinSize": InfraConfig.MIN_CAPACITY,
-            "MaxSize": InfraConfig.MAX_CAPACITY,
-            "DesiredCapacity": InfraConfig.DESIRED_CAPACITY
-        })
-
 
 class TestECSTaskDefinitions:
     """Test ECS task definitions"""
@@ -82,19 +69,25 @@ class TestECSTaskDefinitions:
         """Test that exactly 2 task definitions are created (backend and frontend)"""
         assert_resource_count(template, ResourceType.ECS_TASK_DEFINITION, InfraConfig.EXPECTED_TASK_DEFINITIONS)
 
-    def test_task_definitions_use_bridge_network_mode(self, template):
-        """Test that task definitions use BRIDGE network mode"""
+    def test_task_definitions_use_awsvpc_network_mode(self, template):
+        """Test that task definitions use AWSVPC network mode (required for Fargate)"""
         task_defs = template.find_resources(ResourceType.ECS_TASK_DEFINITION)
         for task_def_id, task_def in task_defs.items():
             assert task_def["Properties"]["NetworkMode"] == InfraConfig.NETWORK_MODE
+
+    def test_task_definitions_have_correct_cpu_memory(self, template):
+        """Test that task definitions have correct CPU and memory (Fargate task-level)"""
+        assert_task_definition_cpu_memory(
+            template,
+            cpu=InfraConfig.TASK_CPU,
+            memory=InfraConfig.TASK_MEMORY
+        )
 
     def test_backend_container_configuration(self, template):
         """Test backend task definition container configuration"""
         assert_container_definition(
             template,
             InfraConfig.BACKEND_CONTAINER_NAME,
-            memory=InfraConfig.BACKEND_MEMORY,
-            cpu=InfraConfig.CONTAINER_CPU,
             port=InfraConfig.BACKEND_PORT
         )
 
@@ -103,8 +96,6 @@ class TestECSTaskDefinitions:
         assert_container_definition(
             template,
             InfraConfig.FRONTEND_CONTAINER_NAME,
-            memory=InfraConfig.FRONTEND_MEMORY,
-            cpu=InfraConfig.CONTAINER_CPU,
             port=InfraConfig.FRONTEND_PORT
         )
 

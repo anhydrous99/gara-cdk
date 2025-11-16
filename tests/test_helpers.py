@@ -75,21 +75,17 @@ def assert_container_definition(template, container_name: str, **expected_proper
     Args:
         template: CDK Template object
         container_name: Name of the container
-        **expected_properties: Expected container properties (memory, cpu, port, etc.)
+        **expected_properties: Expected container properties (port, etc.)
+        Note: For Fargate, CPU and Memory are defined at task level, not container level
     """
     container_def = {
         "Name": container_name,
     }
 
-    if "memory" in expected_properties:
-        container_def["Memory"] = expected_properties["memory"]
-    if "cpu" in expected_properties:
-        container_def["Cpu"] = expected_properties["cpu"]
     if "port" in expected_properties:
         container_def["PortMappings"] = assertions.Match.array_with([
             assertions.Match.object_like({
                 "ContainerPort": expected_properties["port"],
-                "HostPort": expected_properties["port"],
                 "Protocol": "tcp"
             })
         ])
@@ -98,6 +94,20 @@ def assert_container_definition(template, container_name: str, **expected_proper
         "ContainerDefinitions": assertions.Match.array_with([
             assertions.Match.object_like(container_def)
         ])
+    })
+
+
+def assert_task_definition_cpu_memory(template, cpu: str, memory: str):
+    """Assert task definition CPU and memory (Fargate)
+
+    Args:
+        template: CDK Template object
+        cpu: Expected CPU value (as string)
+        memory: Expected memory value (as string)
+    """
+    template.has_resource_properties("AWS::ECS::TaskDefinition", {
+        "Cpu": cpu,
+        "Memory": memory
     })
 
 

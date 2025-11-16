@@ -10,7 +10,6 @@ from aws_cdk import (
     aws_ecr as ecr,
     aws_secretsmanager as secretmanager,
     aws_logs as logs,
-    aws_lambda as lambda_,
     custom_resources as cr,
     aws_s3 as s3,
     aws_dynamodb as dynamodb,
@@ -42,7 +41,8 @@ class GaraCdkStack(Stack):
                     subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS,
                     cidr_mask=24
                 )
-            ]
+            ],
+            vpc_name="gara-vpc"
         )
 
         # Create S3 bucket for image storage
@@ -63,7 +63,7 @@ class GaraCdkStack(Stack):
                 type=dynamodb.AttributeType.STRING
             ),
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
-            removal_policy=RemovalPolicy.RETAIN,
+            removal_policy=RemovalPolicy.DESTROY,
             point_in_time_recovery=True
         )
 
@@ -87,7 +87,7 @@ class GaraCdkStack(Stack):
             self, "GaraEcrRepo",
             repository_name="gara-image-app",
             removal_policy=RemovalPolicy.DESTROY,
-            auto_delete_images=True
+            empty_on_delete=True
         )
 
         # Create ECR repository for frontend
@@ -95,27 +95,15 @@ class GaraCdkStack(Stack):
             self, "GaraFrontendEcrRepo",
             repository_name="gara-frontend-app",
             removal_policy=RemovalPolicy.DESTROY,
-            auto_delete_images=True
+            empty_on_delete=True
         )
 
-        # Create ECS Cluster
+        # Create ECS Cluster (Fargate manages capacity automatically)
         cluster = ecs.Cluster(
             self, "GaraCluster",
             vpc=vpc,
             cluster_name="gara-cluster",
             container_insights=True
-        )
-
-        # Add capacity to cluster (t3.small instances)
-        cluster.add_capacity(
-            "GaraAutoScalingGroup",
-            instance_type=ec2.InstanceType("t3.small"),
-            min_capacity=1,
-            max_capacity=3,
-            desired_capacity=1,
-            vpc_subnets=ec2.SubnetSelection(
-                subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
-            )
         )
 
         # Reference the existing GitHub token secret
@@ -133,6 +121,7 @@ class GaraCdkStack(Stack):
         # Create task role for gara-image ECS tasks
         task_role = iam.Role(
             self, "GaraTaskRole",
+            role_name="gara-backend-task-role",
             assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com")
         )
 
@@ -148,6 +137,7 @@ class GaraCdkStack(Stack):
         # Create task role for frontend ECS tasks
         frontend_task_role = iam.Role(
             self, "GaraFrontendTaskRole",
+            role_name="gara-frontend-task-role",
             assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com")
         )
 
@@ -162,11 +152,27 @@ class GaraCdkStack(Stack):
 
         # Create IAM role for CodeBuild
         codebuild_role = iam.Role(
-            self, "CodeBuidRole",
+            self, "CodeBuildRole",
+            role_name="gara-codebuild-role",
             assumed_by=iam.ServicePrincipal("codebuild.amazonaws.com"),
             managed_policies=[
                 iam.ManagedPolicy.from_aws_managed_policy_name("AmazonEC2ContainerRegistryPowerUser")
             ]
+        )
+
+        # Grant CodeBuild CloudWatch Logs permissions
+        codebuild_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                ],
+                resources=[
+                    "arn:aws:logs:*:*:log-group:/aws/codebuild/*",
+                    "arn:aws:logs:*:*:log-group:/aws/codebuild/*:log-stream:*"
+                ]
+            )
         )
 
         # Grant CodeBuild access to the secret
@@ -178,13 +184,53 @@ class GaraCdkStack(Stack):
             access_token=github_secret.secret_value_from_json('github')
         )
 
+        # Grant CodeBuild permissions to access pipeline artifacts in S3
+        # CodeBuild needs access to the pipeline artifact bucket for input/output
+        codebuild_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "s3:GetObject",
+                    "s3:GetObjectVersion",
+                    "s3:PutObject",
+                    "s3:PutObjectAcl"
+                ],
+                resources=["arn:aws:s3:::codepipeline-*/*"],
+                effect=iam.Effect.ALLOW
+            )
+        )
+
+        # Grant CodeBuild permissions to list buckets (for artifact management)
+        codebuild_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "s3:ListBucket",
+                    "s3:GetBucketVersioning"
+                ],
+                resources=["arn:aws:s3:::codepipeline-*"],
+                effect=iam.Effect.ALLOW
+            )
+        )
+
         # Grant CodeBuild permissions to push to frontend ECR
         frontend_ecr_repo.grant_pull_push(codebuild_role)
 
-        # Create CodeBuild project
-        build_project = codebuild.Project(
-            self, "GaraBuildProject",
-            project_name="gara-build",
+        # Grant CodeBuild permissions for CloudWatch metrics and monitoring
+        codebuild_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "cloudwatch:PutMetricData",
+                    "cloudwatch:GetMetricData",
+                    "cloudwatch:ListMetrics"
+                ],
+                resources=["*"],
+                effect=iam.Effect.ALLOW
+            )
+        )
+
+        # Create CodeBuild project for gara-image (backend)
+        backend_build_project = codebuild.Project(
+            self, "GaraImageBuildProject",
+            project_name="gara-image-build",
             role=codebuild_role,  # type: ignore
             environment=codebuild.BuildEnvironment(
                 build_image=codebuild.LinuxBuildImage.STANDARD_7_0,  # type: ignore
@@ -199,9 +245,6 @@ class GaraCdkStack(Stack):
                     "ECR_REPOSITORY_URI": codebuild.BuildEnvironmentVariable(
                         value=ecr_repo.repository_uri
                     ),
-                    "FRONTEND_ECR_REPOSITORY_URI": codebuild.BuildEnvironmentVariable(
-                        value=frontend_ecr_repo.repository_uri
-                    ),
                     "GITHUB_TOKEN": codebuild.BuildEnvironmentVariable(
                         value=github_secret.secret_arn,
                         type=codebuild.BuildEnvironmentVariableType.SECRETS_MANAGER
@@ -210,7 +253,7 @@ class GaraCdkStack(Stack):
             ),
             source=codebuild.Source.git_hub(
                 owner="anhydrous99",
-                repo="gara",
+                repo="gara-image",
                 branch_or_ref="main",
                 clone_depth=1,
                 webhook=True,
@@ -227,49 +270,182 @@ class GaraCdkStack(Stack):
                     "pre_build": {
                         "commands": [
                             "echo Logging in to Amazon ECR...",
-                            "aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REPOSITORY_URI",
+                            "echo Repository URI: $ECR_REPOSITORY_URI",
+                            "echo AWS Region: $AWS_DEFAULT_REGION",
+                            "aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REPOSITORY_URI || exit 1",
                             "COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)",
-                            "IMAGE_TAG=${COMMIT_HASH:=latest}"
+                            "IMAGE_TAG=${COMMIT_HASH:=latest}",
+                            "echo IMAGE_TAG=$IMAGE_TAG"
                         ]
                     },
                     "build": {
                         "commands": [
                             "echo Build started on `date`",
                             "echo Building gara-image service...",
-                            "cd gara-image && docker build -t $ECR_REPOSITORY_URI:latest -t $ECR_REPOSITORY_URI:$IMAGE_TAG . && cd ..",
-                            "echo Building gara-frontend service...",
-                            "cd gara-frontend && docker build -t $FRONTEND_ECR_REPOSITORY_URI:latest -t $FRONTEND_ECR_REPOSITORY_URI:$IMAGE_TAG . && cd .."
+                            "docker build -t $ECR_REPOSITORY_URI:latest -t $ECR_REPOSITORY_URI:$IMAGE_TAG . || exit 1"
                         ]
                     },
                     "post_build": {
                         "commands": [
                             "echo Build completed on `date`",
-                            "echo Pushing the Docker images...",
-                            "docker push $ECR_REPOSITORY_URI:latest",
-                            "docker push $ECR_REPOSITORY_URI:$IMAGE_TAG",
-                            "docker push $FRONTEND_ECR_REPOSITORY_URI:latest",
-                            "docker push $FRONTEND_ECR_REPOSITORY_URI:$IMAGE_TAG",
-                            "echo Writing image definitions files...",
-                            "printf '[{\"name\":\"gara-image-container\",\"imageUri\":\"%s\"}]' $ECR_REPOSITORY_URI:latest > gara-image-definitions.json",
-                            "printf '[{\"name\":\"gara-frontend-container\",\"imageUri\":\"%s\"}]' $FRONTEND_ECR_REPOSITORY_URI:latest > gara-frontend-definitions.json"
+                            "echo Pushing the Docker image to $ECR_REPOSITORY_URI...",
+                            "docker push $ECR_REPOSITORY_URI:latest || exit 1",
+                            "docker push $ECR_REPOSITORY_URI:$IMAGE_TAG || exit 1",
+                            "echo Writing image definitions file...",
+                            "printf '[{\"name\":\"gara-image-container\",\"imageUri\":\"%s\"}]' $ECR_REPOSITORY_URI:latest > gara-image-definitions.json"
                         ]
                     }
                 },
                 "artifacts": {
-                    "files": ["gara-image-definitions.json", "gara-frontend-definitions.json"]
+                    "files": ["gara-image-definitions.json"]
                 }
             }),
             timeout=Duration.minutes(30)
         )
 
+        # Create CodeBuild project for gara-frontend
+        frontend_build_project = codebuild.Project(
+            self, "GaraFrontendBuildProject",
+            project_name="gara-frontend-build",
+            role=codebuild_role,  # type: ignore
+            environment=codebuild.BuildEnvironment(
+                build_image=codebuild.LinuxBuildImage.STANDARD_7_0,  # type: ignore
+                privileged=True,
+                environment_variables={
+                    "AWS_ACCOUNT_ID": codebuild.BuildEnvironmentVariable(
+                        value=self.account
+                    ),
+                    "AWS_DEFAULT_REGION": codebuild.BuildEnvironmentVariable(
+                        value=self.region
+                    ),
+                    "FRONTEND_ECR_REPOSITORY_URI": codebuild.BuildEnvironmentVariable(
+                        value=frontend_ecr_repo.repository_uri
+                    ),
+                    "GITHUB_TOKEN": codebuild.BuildEnvironmentVariable(
+                        value=github_secret.secret_arn,
+                        type=codebuild.BuildEnvironmentVariableType.SECRETS_MANAGER
+                    )
+                }
+            ),
+            source=codebuild.Source.git_hub(
+                owner="anhydrous99",
+                repo="gara-frontend",
+                branch_or_ref="main",
+                clone_depth=1,
+                webhook=True,
+                webhook_filters=[
+                    codebuild.FilterGroup.in_event_of(
+                        codebuild.EventAction.PUSH,
+                        codebuild.EventAction.PULL_REQUEST_MERGED
+                    ).and_branch_is("main")
+                ]
+            ),
+            build_spec=codebuild.BuildSpec.from_object({
+                "version": "0.2",
+                "phases": {
+                    "pre_build": {
+                        "commands": [
+                            "echo Logging in to Amazon ECR...",
+                            "echo Repository URI: $FRONTEND_ECR_REPOSITORY_URI",
+                            "echo AWS Region: $AWS_DEFAULT_REGION",
+                            "aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $FRONTEND_ECR_REPOSITORY_URI || exit 1",
+                            "COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)",
+                            "IMAGE_TAG=${COMMIT_HASH:=latest}",
+                            "echo IMAGE_TAG=$IMAGE_TAG"
+                        ]
+                    },
+                    "build": {
+                        "commands": [
+                            "echo Build started on `date`",
+                            "echo Building gara-frontend service...",
+                            "docker build -t $FRONTEND_ECR_REPOSITORY_URI:latest -t $FRONTEND_ECR_REPOSITORY_URI:$IMAGE_TAG . || exit 1"
+                        ]
+                    },
+                    "post_build": {
+                        "commands": [
+                            "echo Build completed on `date`",
+                            "echo Pushing the Docker image to $FRONTEND_ECR_REPOSITORY_URI...",
+                            "docker push $FRONTEND_ECR_REPOSITORY_URI:latest || exit 1",
+                            "docker push $FRONTEND_ECR_REPOSITORY_URI:$IMAGE_TAG || exit 1",
+                            "echo Writing image definitions file...",
+                            "printf '[{\"name\":\"gara-frontend-container\",\"imageUri\":\"%s\"}]' $FRONTEND_ECR_REPOSITORY_URI:latest > gara-frontend-definitions.json"
+                        ]
+                    }
+                },
+                "artifacts": {
+                    "files": ["gara-frontend-definitions.json"]
+                }
+            }),
+            timeout=Duration.minutes(30)
+        )
+
+        # Grant CodeBuild permissions for build state and diagnostics
+        codebuild_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "codebuild:BatchGetBuilds",
+                    "codebuild:BatchGetBuildBatches"
+                ],
+                resources=[backend_build_project.project_arn, frontend_build_project.project_arn],
+                effect=iam.Effect.ALLOW
+            )
+        )
+
         # Grant CodeBuild permissions to push to ECR
         ecr_repo.grant_pull_push(codebuild_role)
 
-        # Create Task Definition
-        task_definition = ecs.Ec2TaskDefinition(
+        # Create explicit CloudWatch log groups
+        backend_log_group = logs.LogGroup(
+            self, "GaraBackendLogGroup",
+            log_group_name="/ecs/gara-image",
+            retention=logs.RetentionDays.ONE_WEEK,
+            removal_policy=RemovalPolicy.DESTROY
+        )
+
+        frontend_log_group = logs.LogGroup(
+            self, "GaraFrontendLogGroup",
+            log_group_name="/ecs/gara-frontend",
+            retention=logs.RetentionDays.ONE_WEEK,
+            removal_policy=RemovalPolicy.DESTROY
+        )
+
+        # Create execution role for backend task (ECS uses this to pull images and access secrets)
+        backend_execution_role = iam.Role(
+            self, "GaraBackendExecutionRole",
+            role_name="gara-backend-task-execution-role",
+            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name("service-role/AmazonECSTaskExecutionRolePolicy")
+            ]
+        )
+
+        # Grant execution role permissions to pull from ECR
+        ecr_repo.grant_pull(backend_execution_role)
+
+        # Create execution role for frontend task (ECS uses this to pull images and access secrets)
+        frontend_execution_role = iam.Role(
+            self, "GaraFrontendExecutionRole",
+            role_name="gara-frontend-task-execution-role",
+            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name("service-role/AmazonECSTaskExecutionRolePolicy")
+            ]
+        )
+
+        # Grant execution role permissions to pull from frontend ECR
+        frontend_ecr_repo.grant_pull(frontend_execution_role)
+
+        # Grant execution roles permissions to read secrets from Secrets Manager
+        api_key_secret.grant_read(frontend_execution_role)
+
+        # Create Task Definition for Fargate
+        task_definition = ecs.FargateTaskDefinition(
             self, "GaraTaskDef",
-            network_mode=ecs.NetworkMode.BRIDGE,
-            task_role=task_role
+            family="gara-backend-task",
+            task_role=task_role,
+            execution_role=backend_execution_role,
+            cpu=512,
+            memory_limit_mib=1024
         )
 
         # Add container to task definition
@@ -278,16 +454,13 @@ class GaraCdkStack(Stack):
         task_definition.add_container(
             "gara-image-container",
             image=ecs.ContainerImage.from_registry("nginx:alpine"),
-            memory_limit_mib=1942,
-            cpu=256,
             logging=ecs.LogDrivers.aws_logs(
-                stream_prefix="gara-image",
-                log_retention=logs.RetentionDays.ONE_WEEK
+                log_group=backend_log_group,
+                stream_prefix="gara-image"
             ),
             port_mappings=[
                 ecs.PortMapping(
-                    container_port=80,  # nginx listens on port 80
-                    host_port=80,
+                    container_port=8080,  # Non-root user needs port > 1024
                     protocol=ecs.Protocol.TCP
                 )
             ],
@@ -295,14 +468,13 @@ class GaraCdkStack(Stack):
                 "S3_BUCKET_NAME": image_bucket.bucket_name,
                 "AWS_REGION": self.region,
                 "SECRETS_MANAGER_API_KEY_NAME": "gara-api-key",
-                "PORT": "80",
+                "PORT": "8080",
                 "DYNAMODB_TABLE_NAME": albums_table.table_name
             }
         )
 
-        # Create ECS Service with Application Load Balancer
-        # Start with 0 desired count to avoid running placeholder
-        fargate_service = ecs_patterns.ApplicationLoadBalancedEc2Service(
+        # Create Fargate ECS Service with Application Load Balancer
+        fargate_service = ecs_patterns.ApplicationLoadBalancedFargateService(
             self, "GaraService",
             cluster=cluster,
             service_name="gara-image-service",
@@ -323,33 +495,32 @@ class GaraCdkStack(Stack):
             unhealthy_threshold_count=3
         )
 
-        # Create Frontend Task Definition
-        frontend_task_definition = ecs.Ec2TaskDefinition(
+        # Create Frontend Task Definition for Fargate
+        frontend_task_definition = ecs.FargateTaskDefinition(
             self, "GaraFrontendTaskDef",
-            network_mode=ecs.NetworkMode.BRIDGE,
-            task_role=frontend_task_role
+            family="gara-frontend-task",
+            task_role=frontend_task_role,
+            execution_role=frontend_execution_role,
+            cpu=512,
+            memory_limit_mib=1024
         )
 
         # Add container to frontend task definition
-        frontend_task_definition.add_container(
+        frontend_container = frontend_task_definition.add_container(
             "gara-frontend-container",
             image=ecs.ContainerImage.from_registry("nginx:alpine"),
-            memory_limit_mib=1024,
-            cpu=256,
             logging=ecs.LogDrivers.aws_logs(
-                stream_prefix="gara-frontend",
-                log_retention=logs.RetentionDays.ONE_WEEK
+                log_group=frontend_log_group,
+                stream_prefix="gara-frontend"
             ),
             port_mappings=[
                 ecs.PortMapping(
-                    container_port=3000,  # Next.js default port
-                    host_port=3000,
+                    container_port=80,  # Next.js port standardized to 80
                     protocol=ecs.Protocol.TCP
                 )
             ],
             environment={
                 "NEXT_PUBLIC_API_URL": f"http://{fargate_service.load_balancer.load_balancer_dns_name}",
-                "NEXTAUTH_URL": f"http://<frontend-alb-dns>",
                 "NEXTAUTH_SECRET": "change-me-in-production",
                 "S3_BUCKET_NAME": image_bucket.bucket_name,
                 "AWS_REGION": self.region,
@@ -359,8 +530,8 @@ class GaraCdkStack(Stack):
             }
         )
 
-        # Create Frontend ECS Service with Application Load Balancer
-        frontend_service = ecs_patterns.ApplicationLoadBalancedEc2Service(
+        # Create Fargate Frontend ECS Service with Application Load Balancer
+        frontend_service = ecs_patterns.ApplicationLoadBalancedFargateService(
             self, "GaraFrontendService",
             cluster=cluster,
             service_name="gara-frontend-service",
@@ -381,89 +552,163 @@ class GaraCdkStack(Stack):
             unhealthy_threshold_count=3
         )
 
-        # Create CodePipeline for continuous deployment
-        pipeline = codepipeline.Pipeline(
-            self, "GaraPipeline",
-            pipeline_name="gara-deployment-pipeline",
+        # Update frontend container with NEXTAUTH_URL (set after service is created to get ALB DNS)
+        frontend_container.add_environment(
+            "NEXTAUTH_URL",
+            f"http://{frontend_service.load_balancer.load_balancer_dns_name}"
+        )
+
+        # Create Backend CodePipeline for gara-image
+        backend_pipeline = codepipeline.Pipeline(
+            self, "GaraBackendPipeline",
+            pipeline_name="gara-backend-pipeline",
             restart_execution_on_update=True
         )
 
-        # Source stage
-        source_output = codepipeline.Artifact()
-        source_action = codepipeline_actions.GitHubSourceAction(
+        # Backend Source stage
+        backend_source_output = codepipeline.Artifact()
+        backend_source_action = codepipeline_actions.GitHubSourceAction(
             action_name="GitHub_Source",
             owner="anhydrous99",
-            repo="gara",
+            repo="gara-image",
             oauth_token=github_secret.secret_value_from_json("github"),
-            output=source_output,
+            output=backend_source_output,
             branch="main",
             trigger=codepipeline_actions.GitHubTrigger.WEBHOOK
         )
 
-        pipeline.add_stage(
+        backend_pipeline.add_stage(
             stage_name="Source",
-            actions=[source_action]  # type: ignore
+            actions=[backend_source_action]  # type: ignore
         )
 
-        # Build stage
-        build_output = codepipeline.Artifact()
-        build_action = codepipeline_actions.CodeBuildAction(
+        # Backend Build stage
+        backend_build_output = codepipeline.Artifact()
+        backend_build_action = codepipeline_actions.CodeBuildAction(
             action_name="Build",
-            project=build_project,  # type: ignore
-            input=source_output,
-            outputs=[build_output]
+            project=backend_build_project,  # type: ignore
+            input=backend_source_output,
+            outputs=[backend_build_output]
         )
 
-        pipeline.add_stage(
+        backend_pipeline.add_stage(
             stage_name="Build",
-            actions=[build_action]  # type: ignore
+            actions=[backend_build_action]  # type: ignore
         )
 
-        # Deploy stage - deploy to both gara-image and gara-frontend services
+        # Backend Deploy stage
         deploy_backend_action = codepipeline_actions.EcsDeployAction(
             action_name="DeployBackend",
             service=fargate_service.service,
             deployment_timeout=Duration.minutes(10),
-            image_file=codepipeline.ArtifactPath(build_output, "gara-image-definitions.json")
+            image_file=codepipeline.ArtifactPath(backend_build_output, "gara-image-definitions.json")
         )
 
+        backend_pipeline.add_stage(
+            stage_name="Deploy",
+            actions=[deploy_backend_action]  # type: ignore
+        )
+
+        # Add dependency to ensure backend pipeline triggers after initial deployment
+        backend_pipeline.node.add_dependency(fargate_service)  # type: ignore
+
+        # Create Frontend CodePipeline for gara-frontend
+        frontend_pipeline = codepipeline.Pipeline(
+            self, "GaraFrontendPipeline",
+            pipeline_name="gara-frontend-pipeline",
+            restart_execution_on_update=True
+        )
+
+        # Frontend Source stage
+        frontend_source_output = codepipeline.Artifact()
+        frontend_source_action = codepipeline_actions.GitHubSourceAction(
+            action_name="GitHub_Source",
+            owner="anhydrous99",
+            repo="gara-frontend",
+            oauth_token=github_secret.secret_value_from_json("github"),
+            output=frontend_source_output,
+            branch="main",
+            trigger=codepipeline_actions.GitHubTrigger.WEBHOOK
+        )
+
+        frontend_pipeline.add_stage(
+            stage_name="Source",
+            actions=[frontend_source_action]  # type: ignore
+        )
+
+        # Frontend Build stage
+        frontend_build_output = codepipeline.Artifact()
+        frontend_build_action = codepipeline_actions.CodeBuildAction(
+            action_name="Build",
+            project=frontend_build_project,  # type: ignore
+            input=frontend_source_output,
+            outputs=[frontend_build_output]
+        )
+
+        frontend_pipeline.add_stage(
+            stage_name="Build",
+            actions=[frontend_build_action]  # type: ignore
+        )
+
+        # Frontend Deploy stage
         deploy_frontend_action = codepipeline_actions.EcsDeployAction(
             action_name="DeployFrontend",
             service=frontend_service.service,
             deployment_timeout=Duration.minutes(10),
-            image_file=codepipeline.ArtifactPath(build_output, "gara-frontend-definitions.json")
+            image_file=codepipeline.ArtifactPath(frontend_build_output, "gara-frontend-definitions.json")
         )
 
-        pipeline.add_stage(
+        frontend_pipeline.add_stage(
             stage_name="Deploy",
-            actions=[deploy_backend_action, deploy_frontend_action]  # type: ignore
+            actions=[deploy_frontend_action]  # type: ignore
         )
 
-        # Add dependency to ensure pipeline triggers after initial deployment
-        pipeline.node.add_dependency(fargate_service)  # type: ignore
-        pipeline.node.add_dependency(frontend_service)  # type: ignore
+        # Add dependency to ensure frontend pipeline triggers after initial deployment
+        frontend_pipeline.node.add_dependency(frontend_service)  # type: ignore
 
-        # Create custom resource to trigger the pipeline on stack creation
-        trigger_resource = cr.AwsCustomResource(
-            self, "TriggerPipelineResource",
+        # Create custom resource to trigger the backend pipeline on stack creation
+        backend_trigger_resource = cr.AwsCustomResource(
+            self, "TriggerBackendPipelineResource",
             on_create=cr.AwsSdkCall(
                 service="CodePipeline",
                 action="startPipelineExecution",
                 parameters={
-                    "name": pipeline.pipeline_name
+                    "name": backend_pipeline.pipeline_name
                 },
-                physical_resource_id=cr.PhysicalResourceId.of("trigger-pipeline-initial")
+                physical_resource_id=cr.PhysicalResourceId.of("trigger-backend-pipeline-initial")
             ),
             policy=cr.AwsCustomResourcePolicy.from_statements([
                 iam.PolicyStatement(
                     actions=["codepipeline:StartPipelineExecution"],
-                    resources=[pipeline.pipeline_arn]
+                    resources=[backend_pipeline.pipeline_arn]
                 )
             ])
         )
 
-        # Ensure the custom resource runs after the pipeline is created
-        trigger_resource.node.add_dependency(pipeline)  # type: ignore
+        # Ensure the custom resource runs after the backend pipeline is created
+        backend_trigger_resource.node.add_dependency(backend_pipeline)  # type: ignore
+
+        # Create custom resource to trigger the frontend pipeline on stack creation
+        frontend_trigger_resource = cr.AwsCustomResource(
+            self, "TriggerFrontendPipelineResource",
+            on_create=cr.AwsSdkCall(
+                service="CodePipeline",
+                action="startPipelineExecution",
+                parameters={
+                    "name": frontend_pipeline.pipeline_name
+                },
+                physical_resource_id=cr.PhysicalResourceId.of("trigger-frontend-pipeline-initial")
+            ),
+            policy=cr.AwsCustomResourcePolicy.from_statements([
+                iam.PolicyStatement(
+                    actions=["codepipeline:StartPipelineExecution"],
+                    resources=[frontend_pipeline.pipeline_arn]
+                )
+            ])
+        )
+
+        # Ensure the custom resource runs after the frontend pipeline is created
+        frontend_trigger_resource.node.add_dependency(frontend_pipeline)  # type: ignore
 
         # Output the Backend Load Balancer URL
         CfnOutput(
