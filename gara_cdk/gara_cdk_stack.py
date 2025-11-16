@@ -77,7 +77,12 @@ class GaraCdkStack(Stack):
             "S3_BUCKET_NAME": storage.image_bucket.bucket_name,
             "AWS_REGION": self.region,
             "SECRETS_MANAGER_API_KEY_NAME": secrets.api_key_secret_name,
-            "DYNAMODB_TABLE_NAME": storage.albums_table.table_name
+            "DYNAMODB_TABLE_NAME": storage.albums_table.table_name,
+            "LOG_LEVEL": "info",
+            "LOG_FORMAT": "json",
+            "ENVIRONMENT": "production",
+            "METRICS_ENABLED": "true",
+            "METRICS_NAMESPACE": "GaraImage"
         }
 
         backend_service = FargateServiceConstruct(
@@ -92,7 +97,12 @@ class GaraCdkStack(Stack):
         frontend_additional_env = {
             "NEXT_PUBLIC_API_URL": f"http://{backend_service.load_balancer_dns_name}",
             "S3_BUCKET_NAME": storage.image_bucket.bucket_name,
-            "AWS_REGION": self.region
+            "AWS_REGION": self.region,
+            "LOG_LEVEL": "info",
+            "ENABLE_METRICS": "true",
+            "ENABLE_REQUEST_LOGGING": "true",
+            "CLOUDWATCH_NAMESPACE": "GaraFrontend",
+            "NODE_ENV": "production"
         }
 
         frontend_secrets = {

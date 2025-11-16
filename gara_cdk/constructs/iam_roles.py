@@ -105,6 +105,18 @@ class IamRolesConstruct(Construct):
         albums_table.grant_read_write_data(task_role)
         api_key_secret.grant_read(task_role)
 
+        task_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["cloudwatch:PutMetricData"],
+                resources=["*"],
+                conditions={
+                    "StringEquals": {
+                        "cloudwatch:namespace": "GaraImage"
+                    }
+                }
+            )
+        )
+
         return task_role
 
     def _create_frontend_task_role(
@@ -124,6 +136,18 @@ class IamRolesConstruct(Construct):
         image_bucket.grant_read(task_role)
         albums_table.grant_read_data(task_role)
         api_key_secret.grant_read(task_role)
+
+        task_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["cloudwatch:PutMetricData"],
+                resources=["*"],
+                conditions={
+                    "StringEquals": {
+                        "cloudwatch:namespace": "GaraFrontend"
+                    }
+                }
+            )
+        )
 
         return task_role
 
